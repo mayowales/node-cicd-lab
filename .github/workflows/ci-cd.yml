@@ -1,0 +1,153 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ──────────────────────────────────────────────
+  # Job 1: Test & Coverage
+  # ──────────────────────────────────────────────
+  test:
+    name: Test & Coverage
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests with coverage
+        run: npm test
+
+      # Coverage thresholds are enforced by Jest (see package.json).
+      # This step parses the JSON summary and prints it in the workflow log.
+      - name: Print coverage summary
+        if: always()
+        run: |
+          echo "## Coverage Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f coverage/coverage-summary.json ]; then
+            node -e "
+              const r = require('./coverage/coverage-summary.json').total;
+              const fmt = (m) => r[m].pct + '%';
+              console.log('| Metric | Coverage |');
+              console.log('|--------|----------|');
+              console.log('| Statements | ' + fmt('statements') + ' |');
+              console.log('| Branches | ' + fmt('branches') + ' |');
+              console.log('| Functions | ' + fmt('functions') + ' |');
+              console.log('| Lines | ' + fmt('lines') + ' |');
+            " >> $GITHUB_STEP_SUMMARY
+          else
+            echo "Coverage report not found." >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+
+  # ──────────────────────────────────────────────
+  # Job 2: SonarQube Analysis
+  # ──────────────────────────────────────────────
+  sonarqube:
+    name: SonarQube Analysis
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests with coverage
+        run: npm test
+
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@v5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+      - name: SonarQube Quality Gate
+        uses: SonarSource/sonarqube-quality-gate-action@v1
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+  # ──────────────────────────────────────────────
+  # Job 3: Deploy with PM2
+  # ──────────────────────────────────────────────
+  deploy:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [test, sonarqube]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            set -e
+
+            APP_DIR="/opt/apps/node-cicd-lab"
+
+            # Clone or pull latest code
+            if [ -d "$APP_DIR" ]; then
+              cd $APP_DIR
+              git fetch origin main
+              git reset --hard origin/main
+            else
+              git clone <https://github.com/$>{{ github.repository }}.git $APP_DIR
+              cd $APP_DIR
+            fi
+
+            # Install production dependencies
+            npm ci --omit=dev
+
+            # Ensure PM2 log directory exists
+            sudo mkdir -p /var/log/pm2
+            sudo chown $USER:$USER /var/log/pm2
+
+            # Zero-downtime reload with PM2
+            if pm2 describe node-cicd-lab > /dev/null 2>&1; then
+              echo "Reloading application..."
+              pm2 reload ecosystem.config.js
+            else
+              echo "Starting application for the first time..."
+              pm2 start ecosystem.config.js
+            fi
+
+            # Save PM2 process list
+            pm2 save
+
+            echo "Deployment complete!"
